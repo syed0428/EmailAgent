@@ -1,0 +1,60 @@
+# Environment & Secrets
+.env
+*.env
+!.env.example
+backend/.env
+credentials.json
+client_secret*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Storage & Uploaded Files (Personal data guardrail)
+storage/resumes/*
+backend/storage/resumes/*
+!storage/resumes/.gitkeep
+!backend/storage/resumes/.gitkeep
+*.pdf
+*.docx
+!docs/*.pdf
+
+# OAuth tokens
+token*.json
+gmail_token*.json
+
+# Logs & Databases
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE & OS
+.vscode/
+.idea/
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+
+# Test & Scratch
+scratch/
+test_*.pdf
+test_*.docx
