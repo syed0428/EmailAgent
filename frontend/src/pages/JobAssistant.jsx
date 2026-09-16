@@ -637,7 +637,7 @@ export default function JobAssistant() {
                         color: 'var(--text-muted)',
                       }}
                     >
-                      {sug.category}
+                      {(sug.section ? sug.section.replace('_', ' ') : sug.category || 'Targeted Alignment') + (sug.target_identifier ? ` • ${sug.target_identifier}` : '')}
                     </span>
 
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 600, color: sug.approved_by_user ? 'var(--success)' : 'var(--text-primary)' }}>

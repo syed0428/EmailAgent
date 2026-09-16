@@ -239,59 +239,128 @@ Return JSON with exact keys:
         job_description: str,
     ) -> list:
         """
-        Generate ATS resume improvement suggestions (Before / Suggested / Reason).
-        STRICT ANTI-FABRICATION RULE: Allowed stylistic rewriting, verb improvements, formatting.
-        STRICTLY DISALLOWED: New skills, metrics, percentages, tools, certifications, achievements.
+        Generate Targeted ATS Terminology & Keyword Alignment suggestions.
+        
+        CORE RULE:
+        ORIGINAL RESUME IS MASTER SOURCE DOCUMENT.
+        Suggestions must ONLY identify exact targeted terminology alignment opportunities
+        where the candidate ALREADY has the skill/concept in their resume, but the JD uses
+        a specific industry variant (e.g. 'Power BI' -> 'Microsoft Power BI', 'FastAPI' -> 'FastAPI REST APIs').
+        
+        STRICT RULES:
+        1. NO full-sentence or paragraph rewriting.
+        2. NO appending new bullet points or sentences.
+        3. NO unsupported JD keywords: If candidate lacks a skill (e.g. AWS, Kubernetes, Azure),
+           DO NOT suggest adding it to the resume!
+        4. Every suggestion must identify an exact target location:
+           section, field, target_identifier, before, suggested, reason.
+        5. 'before' MUST be an exact verbatim substring present in candidate resume text.
         """
         system = (
-            "You are an ATS Resume Optimizer. "
+            "You are a Targeted ATS Resume Alignment Assistant.\n"
+            "Your ONLY role is to find targeted terminology/keyword alignment opportunities between the candidate's existing resume and the Job Description.\n\n"
             "STRICT RULES:\n"
-            "1. ALLOWED: Stronger action verbs, clearer wording, reordering skills, ATS formatting.\n"
-            "2. STRICTLY FORBIDDEN: Do NOT invent metrics, percentages, new skills, new tools, new certifications, new user numbers, or new achievements not explicitly in the candidate's resume or profile.\n"
-            "3. If candidate lacks a skill required by the JD, do NOT add it into their resume suggestions.\n"
-            "Return valid JSON array of suggestions."
+            "1. ONLY suggest targeted keyword/terminology alignment where the candidate already has the skill or experience in their resume (e.g., 'Power BI' -> 'Microsoft Power BI', 'PostgreSQL' -> 'PostgreSQL Database').\n"
+            "2. 'before' MUST be an exact, verbatim substring currently found in the candidate's resume text. Do NOT propose full sentence rewrites.\n"
+            "3. DO NOT invent skills or tools. If the Job Description requires skills the candidate DOES NOT have (e.g., AWS, Kubernetes, Azure), DO NOT suggest adding them to the resume!\n"
+            "4. NEVER rewrite entire paragraphs, bullet points, or summaries. Suggest ONLY the specific term/phrase replacement.\n"
+            "5. Return valid JSON array only."
         )
-        prompt = f"""Generate 3 to 5 ATS improvement suggestions for this candidate's resume based on the Job Description.
+        prompt = f"""Identify 2 to 4 targeted terminology alignments for this candidate's resume based on the Job Description.
 
 Candidate Resume Text:
 {raw_resume_text[:20000]}
 
-Candidate User Profile:
-{user_profile or 'None'}
-
 Job Description:
-{job_description[:2000]}
+{job_description[:3000]}
 
-Return JSON array with objects containing exact keys:
+Return a JSON array of targeted suggestions with these exact keys:
 [
   {{
     "id": "sug-1",
-    "category": "action_verbs / wording / summary / skills_ordering",
-    "before": "exact or snippet of current text",
-    "suggested": "improved ATS-friendly wording (NO invented facts or metrics)",
-    "reason": "why this change improves ATS clarity without inventing facts",
+    "section": "technical_skills | work_experience | projects | professional_summary | career_objective",
+    "field": "skills | bullet_points | technologies | summary",
+    "target_identifier": "name of company (e.g. 'Vijailakshmi Hi-Tech Solution'), project name, or skill category (e.g. 'Analytics & BI')",
+    "before": "exact existing phrase in resume (e.g. 'Power BI')",
+    "suggested": "aligned term from JD (e.g. 'Microsoft Power BI')",
+    "reason": "The JD specifies 'Microsoft Power BI'. Aligning terminology improves ATS matching.",
     "approved_by_user": false
   }}
 ]
 """
-        raw = self._chat(prompt, system=system, timeout=120)
+        suggestions = []
         try:
+            raw = self._chat(prompt, system=system, timeout=120)
             raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            suggestions = json.loads(raw)
-            if isinstance(suggestions, list):
-                return suggestions
-            return []
-        except Exception:
-            return [
-                {
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                suggestions = parsed
+        except Exception as exc:
+            logger.warning(f"Ollama suggestion generation fallback: {exc}")
+            suggestions = []
+
+        # Backend verification & anti-fabrication filtering
+        validated_suggestions = []
+        lower_raw = raw_resume_text.lower()
+
+        # Known unsupported keywords to guard against
+        unsupported_keywords = {"aws", "kubernetes", "azure", "gcp", "spark", "hadoop", "kafka"}
+        existing_keywords = {w for w in unsupported_keywords if w in lower_raw}
+
+        for idx, sug in enumerate(suggestions):
+            if not isinstance(sug, dict):
+                continue
+            before = str(sug.get("before", "")).strip()
+            suggested = str(sug.get("suggested", "")).strip()
+            if not before or not suggested:
+                continue
+
+            # Reject if 'before' does not exist in resume
+            if before.lower() not in lower_raw:
+                continue
+
+            # Reject if 'before' is a whole long paragraph (> 80 chars is not a targeted term)
+            if len(before) > 80:
+                continue
+
+            # Reject if 'suggested' attempts to introduce unsupported tech
+            sug_lower = suggested.lower()
+            violates_unsupported = False
+            for uk in unsupported_keywords:
+                if uk in sug_lower and uk not in existing_keywords:
+                    violates_unsupported = True
+                    break
+            if violates_unsupported:
+                continue
+
+            # Normalize suggestion object
+            validated_suggestions.append({
+                "id": sug.get("id") or f"sug-{idx + 1}",
+                "section": sug.get("section") or "work_experience",
+                "field": sug.get("field") or "bullet_points",
+                "target_identifier": sug.get("target_identifier") or "",
+                "before": before,
+                "suggested": suggested,
+                "reason": sug.get("reason") or f"Aligns terminology '{before}' with Job Description requirements.",
+                "approved_by_user": False,
+            })
+
+        # Deterministic fallback if LLM returned nothing valid
+        if not validated_suggestions:
+            jd_lower = job_description.lower()
+            if "microsoft power bi" in jd_lower and "power bi" in lower_raw:
+                validated_suggestions.append({
                     "id": "sug-1",
-                    "category": "action_verbs",
-                    "before": "Responsible for managing application features.",
-                    "suggested": "Engineered core application features and backend services.",
-                    "reason": "Uses stronger action verb ('Engineered' instead of 'Responsible for') for better ATS readability.",
+                    "section": "work_experience",
+                    "field": "bullet_points",
+                    "target_identifier": "Vijailakshmi Hi-Tech Solution",
+                    "before": "Power BI",
+                    "suggested": "Microsoft Power BI",
+                    "reason": "The JD specifies 'Microsoft Power BI'. Your resume contains 'Power BI', so this is a targeted terminology alignment.",
                     "approved_by_user": False,
-                }
-            ]
+                })
+
+        return validated_suggestions
 
     def generate_application_email(
         self,

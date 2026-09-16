@@ -238,10 +238,11 @@ def optimize_resume(req: OptimizeResumeRequest, db: Session = Depends(get_db)):
         app.resume.structured_data = base_structured_data
         db.commit()
 
-    # 2. Apply ONLY user-approved suggestions to structured resume data
-    modified_data, applied_suggestions = resume_svc.apply_approved_suggestions(
+    # 2. Apply ONLY user-approved targeted modifications
+    modified_data, applied_suggestions, modified_raw = resume_svc.apply_approved_suggestions(
         structured_data=base_structured_data,
         approved_suggestions=req.approved_suggestions,
+        raw_text=raw_resume,
     )
 
     # 3. Whole-Resume Anti-Fabrication Safeguard Check
@@ -287,6 +288,7 @@ def optimize_resume(req: OptimizeResumeRequest, db: Session = Depends(get_db)):
         source_raw_text=raw_resume,
         structured_data=modified_data,
         generated_pdf_path=str(output_path),
+        approved_suggestions=req.approved_suggestions,
     )
     if not is_complete:
         resume_svc.delete_resume_file(str(output_path))

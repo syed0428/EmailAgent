@@ -185,13 +185,44 @@ class ResumeService:
     def apply_approved_suggestions(
         structured_data: Dict[str, Any],
         approved_suggestions: List[Dict[str, Any]],
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        raw_text: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
         """
-        Applies ONLY user-approved ATS suggestions into a deep copy of the structured resume JSON.
-        Returns (modified_structured_data, applied_suggestions).
+        Applies ONLY user-approved ATS suggestions into a deep copy of the structured resume JSON
+        and raw master resume text.
+        
+        CORE PRINCIPLES:
+        1. ORIGINAL RESUME = MASTER SOURCE DOCUMENT.
+        2. FINAL = ORIGINAL + ONLY APPROVED TARGETED MODIFICATIONS.
+        3. NO similarity-based replacement.
+        4. NO rewriting complete sentences or paragraphs.
+        5. NO appending AI-generated sentences or bullets.
+        6. NO global replacement across all occurrences unless explicitly targeted:
+           If 'Power BI' appears in multiple places in the resume, only the specific targeted occurrence
+           (identified by section, field, and target_identifier) is replaced.
         """
         modified = copy.deepcopy(structured_data or {})
+        modified_raw = raw_text
         applied: List[Dict[str, Any]] = []
+
+        def _targeted_replace(text: str, before_str: str, after_str: str) -> Tuple[str, bool]:
+            if not text or not before_str:
+                return text, False
+            # Try exact case match first with word boundaries
+            pat_word = re.compile(r'\b' + re.escape(before_str) + r'\b')
+            if pat_word.search(text):
+                return pat_word.sub(after_str, text, count=1), True
+            # Try case-insensitive with word boundaries
+            pat_word_ci = re.compile(r'\b' + re.escape(before_str) + r'\b', re.IGNORECASE)
+            if pat_word_ci.search(text):
+                return pat_word_ci.sub(after_str, text, count=1), True
+            # Try literal replacement (e.g. if punctuation attached)
+            if before_str in text:
+                return text.replace(before_str, after_str, 1), True
+            pat_ci = re.compile(re.escape(before_str), re.IGNORECASE)
+            if pat_ci.search(text):
+                return pat_ci.sub(after_str, text, count=1), True
+            return text, False
 
         for sug in approved_suggestions:
             if not sug.get("approved_by_user"):
@@ -202,128 +233,193 @@ class ResumeService:
             if not before or not suggested:
                 continue
 
-            def _clean_str(s: str) -> str:
-                return " ".join(s.split()).lower()
-
-            clean_before = _clean_str(before)
-
-            def _try_replace(target_text: str) -> Tuple[str, bool]:
-                if not target_text:
-                    return target_text, False
-                # 1. Exact match
-                if before in target_text:
-                    return target_text.replace(before, suggested, 1), True
-                # 2. Case-insensitive match
-                pattern = re.compile(re.escape(before), re.IGNORECASE)
-                if pattern.search(target_text):
-                    return pattern.sub(suggested, target_text, count=1), True
-                # 3. Punctuation stripped match
-                stripped_before = before.rstrip(".").rstrip(",").rstrip(";").strip()
-                if stripped_before and stripped_before in target_text:
-                    return target_text.replace(stripped_before, suggested, 1), True
-                # 4. Normalized whitespace match
-                clean_target = _clean_str(target_text)
-                if clean_before in clean_target:
-                    return suggested, True
-                return target_text, False
+            section = str(sug.get("section", "")).strip().lower()
+            field = str(sug.get("field", "")).strip().lower()
+            target_id = str(sug.get("target_identifier", "")).strip().lower()
 
             replaced = False
 
-            # Search in professional_summary
-            if "professional_summary" in modified and isinstance(modified["professional_summary"], str):
-                new_text, ok = _try_replace(modified["professional_summary"])
-                if ok:
-                    modified["professional_summary"] = new_text
-                    replaced = True
+            # 1. Target: work_experience
+            if not replaced and (section == "work_experience" or not section):
+                jobs = modified.get("work_experience") or []
+                if isinstance(jobs, list):
+                    for job in jobs:
+                        if not isinstance(job, dict):
+                            continue
+                        comp = str(job.get("company", "")).lower()
+                        title = str(job.get("job_title", "")).lower()
+                        match_target = not target_id or (target_id in comp or target_id in title)
+                        if not match_target:
+                            continue
 
-            # Search in work_experience
-            if not replaced and "work_experience" in modified and isinstance(modified["work_experience"], list):
-                for job in modified["work_experience"]:
-                    if not isinstance(job, dict):
-                        continue
-                    bullets = job.get("bullet_points") or []
-                    new_bullets = []
-                    for b in bullets:
-                        new_b, ok = _try_replace(str(b))
-                        if ok:
-                            replaced = True
-                            new_bullets.append(new_b)
-                        else:
-                            new_bullets.append(b)
-                    job["bullet_points"] = new_bullets
-                    if replaced:
-                        break
+                        # Check bullets in this job
+                        bullets = job.get("bullet_points") or []
+                        for b_idx, b in enumerate(bullets):
+                            new_b, ok = _targeted_replace(str(b), before, suggested)
+                            if ok:
+                                bullets[b_idx] = new_b
+                                replaced = True
+                                break
+                        if replaced:
+                            break
 
-            # Search in projects
-            if not replaced and "projects" in modified and isinstance(modified["projects"], list):
-                for proj in modified["projects"]:
-                    if not isinstance(proj, dict):
-                        continue
-                    if "description" in proj and isinstance(proj["description"], str):
-                        new_desc, ok = _try_replace(proj["description"])
+                        # Check technologies list in this job
+                        techs = job.get("technologies") or []
+                        for t_idx, t in enumerate(techs):
+                            new_t, ok = _targeted_replace(str(t), before, suggested)
+                            if ok:
+                                techs[t_idx] = new_t
+                                replaced = True
+                                break
+                        if replaced:
+                            break
+
+            # 2. Target: technical_skills
+            if not replaced and (section in ("technical_skills", "skills") or not section):
+                tech_skills = modified.get("technical_skills")
+                if isinstance(tech_skills, dict):
+                    for cat_name, items in tech_skills.items():
+                        match_cat = not target_id or target_id in cat_name.lower()
+                        if match_cat and isinstance(items, list):
+                            for i_idx, item in enumerate(items):
+                                new_item, ok = _targeted_replace(str(item), before, suggested)
+                                if ok:
+                                    items[i_idx] = new_item
+                                    replaced = True
+                                    break
+                        if replaced:
+                            break
+
+                # Also check flat skills list
+                if not replaced and "skills" in modified and isinstance(modified["skills"], list):
+                    for s_idx, s in enumerate(modified["skills"]):
+                        new_s, ok = _targeted_replace(str(s), before, suggested)
                         if ok:
-                            proj["description"] = new_desc
+                            modified["skills"][s_idx] = new_s
                             replaced = True
                             break
 
-            # Search in skills
-            if not replaced and "skills" in modified and isinstance(modified["skills"], list):
-                new_skills = []
-                for s in modified["skills"]:
-                    new_s, ok = _try_replace(str(s))
-                    if ok:
-                        replaced = True
-                        new_skills.append(new_s)
-                    else:
-                        new_skills.append(s)
-                modified["skills"] = new_skills
+            # 3. Target: projects
+            if not replaced and (section == "projects" or not section):
+                projs = modified.get("projects") or []
+                if isinstance(projs, list):
+                    for proj in projs:
+                        if not isinstance(proj, dict):
+                            continue
+                        p_name = str(proj.get("name", "")).lower()
+                        match_proj = not target_id or target_id in p_name
+                        if not match_proj:
+                            continue
 
-            # Fallback 1: High similarity match on bullet points or summary (> 0.65 similarity)
-            if not replaced:
-                best_ratio = 0.0
-                best_location = None
+                        bullets = proj.get("bullet_points") or []
+                        for b_idx, b in enumerate(bullets):
+                            new_b, ok = _targeted_replace(str(b), before, suggested)
+                            if ok:
+                                bullets[b_idx] = new_b
+                                replaced = True
+                                break
+                        if replaced:
+                            break
 
+                        if "description" in proj and isinstance(proj["description"], str):
+                            new_desc, ok = _targeted_replace(proj["description"], before, suggested)
+                            if ok:
+                                proj["description"] = new_desc
+                                replaced = True
+                                break
+
+                        techs = proj.get("technologies") or []
+                        for t_idx, t in enumerate(techs):
+                            new_t, ok = _targeted_replace(str(t), before, suggested)
+                            if ok:
+                                techs[t_idx] = new_t
+                                replaced = True
+                                break
+                        if replaced:
+                            break
+
+            # 4. Target: professional_summary
+            if not replaced and (section == "professional_summary" or not section):
                 if "professional_summary" in modified and isinstance(modified["professional_summary"], str):
-                    ratio = difflib.SequenceMatcher(None, clean_before, _clean_str(modified["professional_summary"])).ratio()
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_location = ("summary", None, None)
-
-                if "work_experience" in modified and isinstance(modified["work_experience"], list):
-                    for j_idx, job in enumerate(modified["work_experience"]):
-                        if isinstance(job, dict):
-                            for b_idx, b in enumerate(job.get("bullet_points") or []):
-                                ratio = difflib.SequenceMatcher(None, clean_before, _clean_str(str(b))).ratio()
-                                if ratio > best_ratio:
-                                    best_ratio = ratio
-                                    best_location = ("bullet", j_idx, b_idx)
-
-                if best_ratio >= 0.65 and best_location:
-                    if best_location[0] == "summary":
-                        modified["professional_summary"] = suggested
-                        replaced = True
-                    elif best_location[0] == "bullet":
-                        modified["work_experience"][best_location[1]]["bullet_points"][best_location[2]] = suggested
+                    new_sum, ok = _targeted_replace(modified["professional_summary"], before, suggested)
+                    if ok:
+                        modified["professional_summary"] = new_sum
                         replaced = True
 
-            # Fallback 2: If the suggestion is valid and approved, ensure it appears in the primary work experience bullet points
-            if not replaced:
-                if "work_experience" in modified and isinstance(modified["work_experience"], list) and len(modified["work_experience"]) > 0:
-                    if "bullet_points" not in modified["work_experience"][0] or not isinstance(modified["work_experience"][0]["bullet_points"], list):
-                        modified["work_experience"][0]["bullet_points"] = []
-                    modified["work_experience"][0]["bullet_points"].append(suggested)
-                    replaced = True
-                elif "professional_summary" in modified and modified["professional_summary"]:
-                    modified["professional_summary"] += f" {suggested}"
-                    replaced = True
-                else:
-                    modified["professional_summary"] = suggested
-                    replaced = True
+            # 5. Target: career_objective
+            if not replaced and (section == "career_objective" or not section):
+                if "career_objective" in modified and isinstance(modified["career_objective"], str):
+                    new_obj, ok = _targeted_replace(modified["career_objective"], before, suggested)
+                    if ok:
+                        modified["career_objective"] = new_obj
+                        replaced = True
+
+            # 6. Target: education
+            if not replaced and (section == "education" or not section):
+                edus = modified.get("education") or []
+                if isinstance(edus, list):
+                    for edu in edus:
+                        if isinstance(edu, dict):
+                            for k in ["degree", "institution"]:
+                                if k in edu and isinstance(edu[k], str):
+                                    new_k, ok = _targeted_replace(edu[k], before, suggested)
+                                    if ok:
+                                        edu[k] = new_k
+                                        replaced = True
+                                        break
+                        elif isinstance(edu, str):
+                            new_edu, ok = _targeted_replace(edu, before, suggested)
+                            if ok:
+                                edu = new_edu
+                                replaced = True
+                        if replaced:
+                            break
+
+            # 7. Target: certifications
+            if not replaced and (section == "certifications" or not section):
+                certs = modified.get("certifications") or []
+                if isinstance(certs, list):
+                    for c_idx, c in enumerate(certs):
+                        new_c, ok = _targeted_replace(str(c), before, suggested)
+                        if ok:
+                            certs[c_idx] = new_c
+                            replaced = True
+                            break
+
+            # 8. Target: additional_sections
+            if not replaced and "additional_sections" in modified and isinstance(modified["additional_sections"], list):
+                for a_sec in modified["additional_sections"]:
+                    if isinstance(a_sec, dict) and "content" in a_sec:
+                        if isinstance(a_sec["content"], list):
+                            for i_idx, item in enumerate(a_sec["content"]):
+                                new_item, ok = _targeted_replace(str(item), before, suggested)
+                                if ok:
+                                    a_sec["content"][i_idx] = new_item
+                                    replaced = True
+                                    break
+                        elif isinstance(a_sec["content"], str):
+                            new_cnt, ok = _targeted_replace(a_sec["content"], before, suggested)
+                            if ok:
+                                a_sec["content"] = new_cnt
+                                replaced = True
+                    if replaced:
+                        break
 
             if replaced:
                 applied.append(sug)
+                if modified_raw:
+                    if target_id and target_id in modified_raw.lower():
+                        pos = modified_raw.lower().find(target_id)
+                        sub_before = modified_raw[pos:]
+                        new_sub, ok = _targeted_replace(sub_before, before, suggested)
+                        if ok:
+                            modified_raw = modified_raw[:pos] + new_sub
+                        else:
+                            modified_raw, _ = _targeted_replace(modified_raw, before, suggested)
+                    else:
+                        modified_raw, _ = _targeted_replace(modified_raw, before, suggested)
 
-        return modified, applied
+        return modified, applied, modified_raw
 
     @classmethod
     def parse_resume_deterministic(cls, raw_text: str) -> Dict[str, Any]:
@@ -356,15 +452,15 @@ class ResumeService:
                     location = p
                     break
 
-        # Section boundaries detection
+        # Section boundaries detection with flexible whitespace
         sec_patterns = [
-            ('summary', re.compile(r'^(?:PROFESSIONAL\s+SUMMARY|SUMMARY|EXECUTIVE\s+SUMMARY)\b', re.I | re.M)),
-            ('technical_skills', re.compile(r'^(?:TECHNICAL\s+SKILLS|CORE\s+SKILLS|CORE\s+COMPETENCIES)\b', re.I | re.M)),
-            ('experience', re.compile(r'^(?:PROFESSIONAL\s+EXPERIENCE|WORK\s+EXPERIENCE|EXPERIENCE|EMPLOYMENT\s+HISTORY)\b', re.I | re.M)),
-            ('projects', re.compile(r'^(?:KEY\s+PROJECTS|PROJECTS|ACADEMIC\s+PROJECTS)\b', re.I | re.M)),
-            ('education', re.compile(r'^(?:EDUCATION|ACADEMIC\s+BACKGROUND)\b', re.I | re.M)),
-            ('certifications', re.compile(r'^(?:CERTIFICATIONS|CERTIFICATES|LICENSES\s+&\s+CERTIFICATIONS)\b', re.I | re.M)),
-            ('career_objective', re.compile(r'^(?:CAREER\s+OBJECTIVE|OBJECTIVE)\b', re.I | re.M)),
+            ('summary', re.compile(r'(?:^|\n)\s*(?:PROFESSIONAL\s+SUMMARY|SUMMARY|EXECUTIVE\s+SUMMARY)\s*(?:\n|$)', re.I)),
+            ('technical_skills', re.compile(r'(?:^|\n)\s*(?:TECHNICAL\s+SKILLS|CORE\s+SKILLS|CORE\s+COMPETENCIES|SKILLS)\s*(?:\n|$)', re.I)),
+            ('experience', re.compile(r'(?:^|\n)\s*(?:PROFESSIONAL\s+EXPERIENCE|WORK\s+EXPERIENCE|EXPERIENCE|EMPLOYMENT\s+HISTORY)\s*(?:\n|$)', re.I)),
+            ('projects', re.compile(r'(?:^|\n)\s*(?:KEY\s+PROJECTS|PROJECTS|ACADEMIC\s+PROJECTS)\s*(?:\n|$)', re.I)),
+            ('education', re.compile(r'(?:^|\n)\s*(?:EDUCATION|ACADEMIC\s+BACKGROUND)\s*(?:\n|$)', re.I)),
+            ('certifications', re.compile(r'(?:^|\n)\s*(?:CERTIFICATIONS|CERTIFICATES|LICENSES\s+&\s+CERTIFICATIONS)\s*(?:\n|$)', re.I)),
+            ('career_objective', re.compile(r'(?:^|\n)\s*(?:CAREER\s+OBJECTIVE|OBJECTIVE)\s*(?:\n|$)', re.I)),
         ]
 
         matches = []
@@ -378,6 +474,25 @@ class ResumeService:
             start, end, sec_name = matches[i]
             next_start = matches[i+1][0] if i + 1 < len(matches) else len(raw_text)
             sections[sec_name] = raw_text[end:next_start].strip()
+
+        # Catch any additional unclassified sections
+        additional_sections = []
+        custom_header_pat = re.compile(r'(?:^|\n)\s*([A-Z][A-Z\s&/]{3,35})\s*(?:\n|$)', re.M)
+        standard_header_names = {'summary', 'technical_skills', 'experience', 'projects', 'education', 'certifications', 'career_objective'}
+        for m in custom_header_pat.finditer(raw_text):
+            h_text = m.group(1).strip()
+            # Check if this heading matches any standard section
+            is_std = any(pat.match(f"\n{h_text}\n") for _, pat in sec_patterns)
+            if not is_std and h_text not in ('CANDIDATE', 'RESUME', 'CURRICULUM VITAE'):
+                # Extract text up to next heading
+                h_end = m.end()
+                next_m = custom_header_pat.search(raw_text, h_end)
+                content_chunk = raw_text[h_end:next_m.start() if next_m else len(raw_text)].strip()
+                if len(content_chunk) > 10 and not any(a['title'] == h_text for a in additional_sections):
+                    additional_sections.append({
+                        "title": h_text,
+                        "content": content_chunk
+                    })
 
         # 1. Summary
         summary = sections.get('summary', '')
@@ -573,6 +688,7 @@ class ResumeService:
             "projects": projects,
             "education": education,
             "certifications": certifications,
+            "additional_sections": additional_sections,
         }
 
     @classmethod
@@ -644,6 +760,9 @@ class ResumeService:
         det_certs = det.get("certifications") or []
         if isinstance(llm_certs, list) and len(llm_certs) >= len(det_certs):
             merged["certifications"] = llm_certs
+
+        # Additional sections: always preserve deterministic
+        merged["additional_sections"] = det.get("additional_sections", [])
 
         return merged
 
@@ -889,6 +1008,23 @@ class ResumeService:
                     story.append(Paragraph(f"&bull; {esc(c)}", bullet_style))
             else:
                 story.append(Paragraph(esc(certs), body_style))
+            story.append(Spacer(1, 3))
+
+        # 10. Additional / Custom Sections
+        add_secs = structured_data.get("additional_sections") or []
+        for sec in add_secs:
+            if isinstance(sec, dict) and sec.get("title") and sec.get("content"):
+                story.append(Paragraph(esc(sec["title"].upper()), section_heading))
+                story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e2e8f0"), spaceBefore=1, spaceAfter=3))
+                content = sec["content"]
+                if isinstance(content, list):
+                    for item in content:
+                        story.append(Paragraph(f"&bull; {esc(item)}", bullet_style))
+                else:
+                    for line in str(content).splitlines():
+                        if line.strip():
+                            story.append(Paragraph(esc(line.strip()), body_style))
+                story.append(Spacer(1, 3))
 
         doc.build(story)
         return output_path
@@ -899,11 +1035,23 @@ class ResumeService:
         source_raw_text: str,
         structured_data: Dict[str, Any],
         generated_pdf_path: str,
+        approved_suggestions: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[bool, List[str]]:
         """
         Anti-Data-Loss Validation Guardrail:
         Extracts plain text from the generated PDF and asserts that 100% of candidate
-        factual entities (name, contact, employers, titles, projects, education, certs, objective)
+        factual entities:
+        - Candidate name
+        - Contact info (Email, Phone, LinkedIn)
+        - All employers
+        - All job titles
+        - All dates
+        - All projects (every single project name)
+        - Key content of project descriptions and bullet points
+        - All education institutions & degrees
+        - All certifications
+        - Career objective
+        - No unsupported skills added
         are faithfully rendered without any dropping or truncating.
         Returns (is_valid, list_of_missing_entities).
         """
@@ -983,6 +1131,16 @@ class ResumeService:
             matched_words = [w for w in obj_words if w in norm_pdf]
             if len(matched_words) < len(obj_words) * 0.4:
                 missing.append(f"Career Objective: '{obj[:40]}...'")
+
+        # 8. Guard against newly injected unsupported technologies
+        unsupported_keywords = {"aws", "kubernetes", "azure", "gcp", "spark", "hadoop"}
+        norm_source = norm(source_raw_text)
+        for uk in unsupported_keywords:
+            if uk in norm_pdf and uk not in norm_source:
+                # Check if it was explicitly approved by user
+                approved_texts = " ".join([str(s.get("suggested", "")) for s in (approved_suggestions or []) if s.get("approved_by_user")]).lower()
+                if uk not in approved_texts:
+                    missing.append(f"Unsupported Technology Injected: '{uk.upper()}'")
 
         return len(missing) == 0, missing
 
@@ -1065,6 +1223,16 @@ class ResumeService:
             for c in structured_data["certifications"]:
                 doc.add_paragraph(str(c), style="List Bullet")
 
+        if structured_data.get("additional_sections"):
+            for sec in structured_data["additional_sections"]:
+                if isinstance(sec, dict) and sec.get("title") and sec.get("content"):
+                    doc.add_heading(sec["title"], level=1)
+                    if isinstance(sec["content"], list):
+                        for item in sec["content"]:
+                            doc.add_paragraph(str(item), style="List Bullet")
+                    else:
+                        doc.add_paragraph(str(sec["content"]))
+
         doc.save(output_path)
         return output_path
 
@@ -1086,7 +1254,6 @@ class ResumeService:
         Programmatic verification step after PDF/DOCX generation:
         Extracts plain text from the newly generated document and verifies that:
         1. Every approved suggestion's 'suggested' text is actually present in the document.
-        2. The original 'before' text is no longer present (unless it is a substring of suggested).
         Returns (is_valid, error_detail).
         """
         if not os.path.exists(file_path):
@@ -1107,12 +1274,9 @@ class ResumeService:
                 continue
 
             suggested = str(sug.get("suggested", "")).strip()
-            before = str(sug.get("before", "")).strip()
-
             norm_suggested = _norm(suggested)
-            norm_before = _norm(before)
 
-            # 1. Assert suggested text is present
+            # Assert suggested text is present
             if norm_suggested not in norm_extracted:
                 words = norm_suggested.split()
                 sub_check = " ".join(words[:min(len(words), 8)])
@@ -1120,14 +1284,6 @@ class ResumeService:
                     return False, (
                         f"Programmatic verification FAILED: Approved ATS suggestion "
                         f"'{suggested}' was NOT found in the generated {file_type.upper()} document."
-                    )
-
-            # 2. Assert old 'before' text has been replaced
-            if norm_before and norm_before in norm_extracted:
-                if norm_before not in norm_suggested and norm_before != norm_suggested:
-                    return False, (
-                        f"Programmatic verification FAILED: Original text '{before}' "
-                        f"is still present in the generated {file_type.upper()} document."
                     )
 
         return True, ""
