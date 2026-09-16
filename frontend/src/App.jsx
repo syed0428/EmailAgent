@@ -50,7 +50,7 @@ export default function App() {
           <div style={{ marginBottom: '4px', fontWeight: 600 }}>Phase 1</div>
           <div>Stack verification</div>
           <div style={{ marginTop: '8px' }}>
-            <a href="http://localhost:8000/docs" target="_blank" rel="noreferrer"
+            <a href="http://127.0.0.1:8000/docs" target="_blank" rel="noreferrer"
               style={{ color: 'var(--accent-light)', fontSize: '11px' }}>
               API Docs ↗
             </a>
